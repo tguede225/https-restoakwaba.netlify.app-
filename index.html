@@ -432,6 +432,7 @@ const IC = {
   search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
   edit: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
   down: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
   cart: '<circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/>',
   swap: '<path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/>',
   lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
@@ -1047,6 +1048,71 @@ function shiftReport(shift) {
 function csv(rows) {
   return '\ufeff' + rows.map(r => r.map(c => { c = String(c == null ? '' : c); return /[";\n\r]/.test(c) ? '"' + c.replace(/"/g, '""') + '"' : c; }).join(';')).join('\r\n');
 }
+function parseCsvText(text) {
+  text = String(text || '').replace(/^\ufeff/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const firstLine = text.slice(0, text.indexOf('\n') > -1 ? text.indexOf('\n') : text.length);
+  const delim = firstLine.split(';').length >= firstLine.split(',').length ? ';' : ',';
+  const rows = []; let row = [], field = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) { if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; } else field += c; }
+    else if (c === '"') inQ = true;
+    else if (c === delim) { row.push(field); field = ''; }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else field += c;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(c => String(c).trim() !== ''));
+}
+function csvNormKey(s) { return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+const STOCK_CSV_FIELD_MAP = {
+  article: 'name', nom: 'name', name: 'name', designation: 'name',
+  categorie: 'cat', category: 'cat',
+  quantite: 'qty', qte: 'qty', qty: 'qty', enstock: 'qty', stock: 'qty',
+  unite: 'unit', unit: 'unit',
+  seuil: 'min', seuilalerte: 'min', min: 'min',
+  coutunitaire: 'cost', cout: 'cost', prixunitaire: 'cost', cost: 'cost',
+  valeur: null, value: null,
+  fournisseur: 'supplier', supplier: 'supplier'
+};
+function parseStockCsv(text) {
+  const rows = parseCsvText(text);
+  if (!rows.length) return {error: 'empty'};
+  const colField = rows[0].map(h => { const k = csvNormKey(h); return STOCK_CSV_FIELD_MAP.hasOwnProperty(k) ? STOCK_CSV_FIELD_MAP[k] : undefined; });
+  if (!colField.includes('name')) return {error: 'noname'};
+  const toCreate = [], toUpdate = [], errors = [];
+  rows.slice(1).forEach((r, idx) => {
+    const ln = idx + 2, rec = {};
+    colField.forEach((f, i) => { if (f) rec[f] = r[i] !== undefined ? String(r[i]).trim() : ''; });
+    const nm = (rec.name || '').trim();
+    if (!nm) { errors.push('Ligne ' + ln + ' : nom manquant.'); return; }
+    let qty = null, min = null, cost = null;
+    if (rec.qty) { qty = num(rec.qty); if (!Number.isFinite(qty) || qty < 0) return errors.push('Ligne ' + ln + ' (' + nm + ') : quantit\u00e9 invalide.'); }
+    if (rec.min) { min = num(rec.min); if (!Number.isFinite(min) || min < 0) return errors.push('Ligne ' + ln + ' (' + nm + ') : seuil invalide.'); }
+    if (rec.cost) { cost = num(rec.cost); if (!Number.isFinite(cost) || cost < 0) return errors.push('Ligne ' + ln + ' (' + nm + ') : co\u00fbt invalide.'); }
+    const existing = S.stock.find(s => s.name.trim().toLowerCase() === nm.toLowerCase());
+    if (existing) toUpdate.push({s: existing, cat: rec.cat, unit: rec.unit, qty, min, cost, supplier: rec.supplier});
+    else toCreate.push({name: nm, cat: rec.cat || 'Autre', unit: rec.unit || '', qty: qty || 0, min: min || 0, cost: cost || 0, supplier: rec.supplier || ''});
+  });
+  return {toCreate, toUpdate, errors};
+}
+function applyStockImport(result) {
+  result.toUpdate.forEach(u => {
+    const s = u.s;
+    if (u.cat) s.cat = u.cat;
+    if (u.unit) s.unit = u.unit;
+    if (u.supplier) s.supplier = u.supplier;
+    if (u.min != null) s.min = round3(u.min);
+    if (u.cost != null) s.cost = round2(u.cost);
+    if (u.qty != null) { const diff = round3(u.qty - s.qty); if (diff !== 0) { s.qty = round3(u.qty); logMove(s, diff, 'inventaire', '', 'Import CSV'); } }
+  });
+  result.toCreate.forEach(c => {
+    const s = {id: uid('s'), name: c.name, cat: c.cat, unit: c.unit, qty: round3(c.qty), min: round3(c.min), cost: round2(c.cost), supplier: c.supplier};
+    S.stock.push(s);
+    if (s.qty > 0) logMove(s, s.qty, 'creation', '', 'Import CSV');
+  });
+  persistCatalog(); persistLog();
+}
 function resizeImageFile(file, maxDim, quality) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1306,7 +1372,9 @@ function viewStock() {
   const moves = S.log.slice(0, 80).map(m => '<tr><td class="tnum">' + esc(dfDT.format(new Date(m.t))) + '</td><td><b>' + esc(m.name) + '</b></td><td><span class="pill ' + (m.delta >= 0 ? 'ok' : 'low') + '">' + (MOVES[m.type] || m.type) + '</span></td>' +
     '<td class="num">' + (m.delta > 0 ? '+' : '') + qf(m.delta) + ' ' + esc(m.unit) + '</td><td class="num">' + qf(m.after) + ' ' + esc(m.unit) + '</td><td class="muted">' + esc([m.ref, m.note].filter(Boolean).join(' · ')) + '</td></tr>').join('');
   const dlBtn = S.dl ? '<button type="button" class="btn" data-act="stk-csv">' + ic('down') + 'Exporter</button>' : '';
-  return vh('Stock', S.stock.length + ' articles suivis', dlBtn + '<button type="button" class="btn" data-act="stk-shop">Liste de réapprovisionnement</button><button type="button" class="btn btn-primary" data-act="stk-new">' + ic('plus') + 'Nouvel article</button>') +
+  const impBtn = '<label class="btn" style="cursor:pointer">' + ic('upload') + 'Importer un CSV<input type="file" accept=".csv,text/csv" data-bind="stock-import" hidden></label>';
+  return vh('Stock', S.stock.length + ' articles suivis', dlBtn + impBtn + '<button type="button" class="btn" data-act="stk-shop">Liste de réapprovisionnement</button><button type="button" class="btn btn-primary" data-act="stk-new">' + ic('plus') + 'Nouvel article</button>') +
+    '<p class="muted small" style="margin:-14px 0 16px">Importer un CSV pour remplir ou mettre à jour le stock en masse : reprenez le fichier exporté, un article existant (même nom) est mis à jour, un nom inconnu crée un nouvel article.</p>' +
     '<div class="kpis"><div class="kpi"><div class="kpi-l">Articles</div><div class="kpi-v">' + S.stock.length + '</div></div><div class="kpi"><div class="kpi-l">Valeur du stock</div><div class="kpi-v">' + money(val) + '</div></div>' +
     '<div class="kpi' + (low ? ' warn' : '') + '"><div class="kpi-l">Stock bas</div><div class="kpi-v">' + low + '</div></div><div class="kpi' + (out ? ' bad' : '') + '"><div class="kpi-l">Ruptures</div><div class="kpi-v">' + out + '</div></div></div>' +
     '<div class="toolbar"><div class="chips">' + chip('stock-tab', 'articles', 'Articles', u.stab === 'articles') + chip('stock-tab', 'mouvements', 'Mouvements', u.stab === 'mouvements') + '</div>' +
@@ -2312,6 +2380,22 @@ function onField(e) {
           d.customers = Array.isArray(d.customers) ? d.customers : []; d.rooms = Array.isArray(d.rooms) ? d.rooms : []; d.roomPayments = Array.isArray(d.roomPayments) ? d.roomPayments : []; d.halls = Array.isArray(d.halls) ? d.halls : []; d.hallPayments = Array.isArray(d.hallPayments) ? d.hallPayments : []; d.employees = Array.isArray(d.employees) ? d.employees : []; d.expenses = Array.isArray(d.expenses) ? d.expenses : []; d.users = Array.isArray(d.users) ? d.users : []; d.shifts = Array.isArray(d.shifts) ? d.shifts : []; d.accessLog = Array.isArray(d.accessLog) ? d.accessLog : [];
           confirmBox('Restaurer cette sauvegarde ?', d.products.length + ' produits, ' + d.stock.length + ' articles et ' + d.orders.length + ' commandes. Les données actuelles seront remplacées.', 'Restaurer', () => { replaceAll(d); toast('Sauvegarde restaurée.'); });
         } catch (err) { toast("Ce fichier n'est pas une sauvegarde Comptoir valide."); }
+      };
+      fr.readAsText(t.files[0]); t.value = '';
+    } break;
+    case 'stock-import': if (isChange && t.files && t.files[0]) {
+      const fr = new FileReader();
+      fr.onload = () => {
+        const res = parseStockCsv(fr.result);
+        if (res.error === 'empty') return toast('Le fichier CSV est vide.');
+        if (res.error === 'noname') return toast('Colonne « Article » introuvable dans le fichier.');
+        if (!res.toCreate.length && !res.toUpdate.length) return toast(res.errors.length ? 'Aucune ligne valide importée (' + res.errors.length + ' erreur(s)).' : 'Aucune donnée à importer.');
+        const parts = [];
+        if (res.toUpdate.length) parts.push(res.toUpdate.length + ' article' + (res.toUpdate.length > 1 ? 's' : '') + ' mis à jour');
+        if (res.toCreate.length) parts.push(res.toCreate.length + ' nouvel' + (res.toCreate.length > 1 ? 's' : '') + ' article' + (res.toCreate.length > 1 ? 's' : '') + ' créé' + (res.toCreate.length > 1 ? 's' : ''));
+        let msg = parts.join(' · ') + '.';
+        if (res.errors.length) msg += ' ' + res.errors.length + ' ligne(s) ignorée(s) : ' + res.errors.slice(0, 5).join(' ') + (res.errors.length > 5 ? ' …' : '');
+        confirmBox('Importer ce fichier CSV ?', msg, 'Importer', () => { applyStockImport(res); render(); toast('Stock mis à jour depuis le CSV.' + (res.errors.length ? ' ' + res.errors.length + ' ligne(s) ignorée(s).' : '')); });
       };
       fr.readAsText(t.files[0]); t.value = '';
     } break;
