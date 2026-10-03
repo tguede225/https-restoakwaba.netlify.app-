@@ -531,7 +531,6 @@ function seedData() {
 /* =====================================================================
    État & persistance
    ===================================================================== */
-const LS_KEY = 'comptoir.v1';
 const S = {
   cfg: null, products: [], stock: [], orders: [], invoices: [], customers: [], rooms: [], roomPayments: [], halls: [], hallPayments: [], employees: [], expenses: [], users: [], shifts: [], log: [], accessLog: [],
   ui: {view: 'dashboard', qpos: '', kind: 'tout', cat: '', ticketOpen: false, sf: 'tout', qcarte: '', kcarte: 'tout',
@@ -539,13 +538,18 @@ const S = {
        jperiod: 'today', jtype: 'tout', quser: 'tout', chMonth: 0, slMonth: 0, qemp: '', femp: 'tout', qdep: '', dperiod: 'tout', fdep: 'tout'},
   draft: {type: 'sur_place', table: '1', ref: '', note: '', items: [], customerId: ''},
   session: {userId: '', name: '', role: ''},
-  sync: 'local', dl: false
+  sync: 'local', dl: false,
+  boot: 'connecting', bootError: ''
 };
 let dbh = null, dlh = null, M = null;
 const NATIVE_CLAUDE = !!(window.claude && window.claude.use);
 
-function lsLoad() { try { const r = localStorage.getItem(LS_KEY); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
-function lsSave() { try { localStorage.setItem(LS_KEY, JSON.stringify({cfg: S.cfg, products: S.products, stock: S.stock, orders: S.orders, invoices: S.invoices, customers: S.customers, rooms: S.rooms, roomPayments: S.roomPayments, halls: S.halls, hallPayments: S.hallPayments, employees: S.employees, expenses: S.expenses, users: S.users, shifts: S.shifts, log: S.log, accessLog: S.accessLog})); } catch (e) {} }
+/* Le navigateur ne sert plus jamais de base de données : ces deux fonctions
+   sont des no-op volontaires, conservées pour ne pas toucher tous leurs
+   points d'appel. Les données vivent uniquement sur le serveur connecté
+   (PHP + MySQL, serveur privé Node.js, ou Firebase) ; voir anyServerConfigured(). */
+function lsLoad() { return null; }
+function lsSave() {}
 function loadInto(d) {
   const base = seedData();
   S.cfg = Object.assign({}, base.cfg, d.cfg || {});
@@ -576,11 +580,11 @@ function logout() {
   toast('Session fermée.');
 }
 (function boot() {
-  const saved = lsLoad();
-  loadInto(saved && Array.isArray(saved.products) && Array.isArray(saved.stock) ? saved : seedData());
+  loadInto(seedData());
   try { S.session.userId = sessionStorage.getItem('comptoir.session') || ''; } catch (e) {}
   syncSession();
   S.ui.view = defaultViewFor(S.session.role);
+  S.boot = NATIVE_CLAUDE ? 'ready' : (anyServerConfigured() ? 'connecting' : 'needs-config');
 })();
 
 const wq = {};
@@ -735,6 +739,16 @@ async function bootPrivateServerSync() {
 const PHP_KEY = 'comptoir.phpserver';
 const PHP_POLL_MS = 2500;
 function getPhpServerConfig() { try { return JSON.parse(localStorage.getItem(PHP_KEY) || 'null'); } catch (e) { return null; } }
+/* Un vrai serveur (PHP+MySQL, Node.js privé, ou Firebase) est-il indiqué ?
+   Ne dit rien sur la joignabilité du serveur, seulement sur la présence
+   d'une configuration — c'est ce qui détermine si le logiciel doit
+   afficher l'écran de connexion obligatoire avant toute utilisation. */
+function anyServerConfigured() {
+  const p = getPhpServerConfig(); if (p && p.url) return true;
+  const n = getPrivateServerConfig(); if (n && n.url) return true;
+  if (getFirebaseConfig()) return true;
+  return false;
+}
 function phpServerRequest(base, code, action, opts) {
   opts = opts || {};
   let url = base + '/api.php?action=' + encodeURIComponent(action);
@@ -810,9 +824,9 @@ function attachDb() {
           S.cfg = Object.assign({}, base.cfg, d.cfg || {}); S.products = d.products || []; S.stock = d.stock || []; S.rooms = d.rooms || []; S.halls = d.halls || []; S.users = d.users || [];
           lsSave(); render();
         }
-        S.sync = 'db'; renderSide();
+        S.sync = 'db'; const wasBooting = S.boot !== 'ready'; S.boot = 'ready'; if (wasBooting) render(); else renderSide();
       } else if (!snap.metadata.fromCache && !seeded) {
-        seeded = true; S.sync = 'db'; persistCatalog(); renderSide();
+        seeded = true; S.sync = 'db'; const wasBooting = S.boot !== 'ready'; S.boot = 'ready'; persistCatalog(); if (wasBooting) render(); else renderSide();
       }
     }, () => { S.sync = 'local'; renderSide(); });
     db.doc('gestion/journal').onSnapshot(snap => {
@@ -1775,13 +1789,58 @@ function viewJournal() {
     '<p class="muted small" style="margin-top:10px">Le journal enregistre les connexions, déconnexions et les pages consultées par chaque compte. Il est conservé jusqu\'à 2000 évènements les plus récents.</p>';
 }
 
+/* ---------- Connexion au serveur (formulaires partagés) ---------- */
+function syncFormsHtml() {
+  if (NATIVE_CLAUDE) return '';
+  const fbCfg = getFirebaseConfig();
+  const psCfg = getPrivateServerConfig();
+  const phpCfg = getPhpServerConfig();
+  return '<h3 style="margin-bottom:8px">Connecter un serveur PHP + MySQL (hébergement mutualisé)</h3>' +
+    '<p class="muted small" style="margin-bottom:10px">Pour un hébergement classique (OVH, o2switch, cPanel…) avec PHP, MySQL et Apache — le plus courant et le moins cher. Déposez le paquet « serveur-prive-php » fourni sur votre hébergement, puis indiquez son adresse ici. La synchronisation se fait par vérification régulière (toutes les ' + (PHP_POLL_MS / 1000) + ' secondes environ) plutôt qu\'instantanément.</p>' +
+    (phpCfg ? '<p class="muted small" style="margin-bottom:10px">Serveur connecté : <b>' + esc(normalizePrivateServerUrl(phpCfg.url)) + '</b> · état : ' + (S.sync === 'db' ? '<span class="pill ok">Connecté</span>' : '<span class="pill low">Non connecté (vérifiez l\'adresse, le code et que api.php est bien déployé)</span>') + '</p>' : '') +
+    '<div class="row2">' + fld('Adresse du serveur', '<input class="in" id="php-url" placeholder="https://votre-domaine.com/comptoir-serveur" value="' + esc(phpCfg ? phpCfg.url : '') + '" autocomplete="off">', 'Dossier où vous avez déposé api.php sur votre hébergement') +
+    fld('Code d\'accès (facultatif)', '<input class="in" id="php-code" placeholder="Code défini dans config.php" value="' + esc(phpCfg ? (phpCfg.code || '') : '') + '" autocomplete="off">') + '</div>' +
+    '<div class="vh-actions"><button type="button" class="btn btn-primary" data-act="php-save">' + ic('swap') + 'Enregistrer et se connecter</button>' + (phpCfg ? '<button type="button" class="btn btn-danger" data-act="php-clear">Retirer le serveur PHP</button>' : '') + '</div>' +
+    '<p class="muted small" style="margin-top:10px">Voir le fichier LISEZ-MOI.md du paquet « serveur-prive-php » pour la mise en place (base MySQL, config.php, dépôt par FTP).' + (phpCfg ? '' : ' Si ce serveur est connecté, il est utilisé en priorité sur les options ci-dessous.') + '</p>' +
+    '<div class="hr"></div><h3 style="margin-bottom:8px">Connecter mon serveur privé (architecture client/serveur)</h3>' +
+    '<p class="muted small" style="margin-bottom:10px">Reliez Comptoir au petit serveur Node.js fourni avec le logiciel (paquet « serveur-prive »), installé sur votre propre machine ou votre VPS. Toutes les données (commandes, stock, ventes…) sont alors stockées sur ce serveur et partagées en temps réel entre tous les postes connectés — caisse, cuisine, bureau.</p>' +
+    (psCfg ? '<p class="muted small" style="margin-bottom:10px">Serveur connecté : <b>' + esc(normalizePrivateServerUrl(psCfg.url)) + '</b> · état : ' + (S.sync === 'db' ? '<span class="pill ok">Connecté</span>' : '<span class="pill low">Non connecté (vérifiez l\'adresse, le code et que le serveur est démarré)</span>') + '</p>' : '') +
+    '<div class="row2">' + fld('Adresse du serveur', '<input class="in" id="ps-url" placeholder="http://192.168.1.50:4000" value="' + esc(psCfg ? psCfg.url : '') + '" autocomplete="off">', 'Adresse locale ou domaine de votre serveur privé') +
+    fld('Code d\'accès (facultatif)', '<input class="in" id="ps-code" placeholder="Code défini sur le serveur (ACCESS_CODE)" value="' + esc(psCfg ? (psCfg.code || '') : '') + '" autocomplete="off">') + '</div>' +
+    '<div class="vh-actions"><button type="button" class="btn btn-primary" data-act="ps-save">' + ic('swap') + 'Enregistrer et se connecter</button>' + (psCfg ? '<button type="button" class="btn btn-danger" data-act="ps-clear">Retirer le serveur privé</button>' : '') + '</div>' +
+    '<p class="muted small" style="margin-top:10px">Voir le fichier LISEZ-MOI.md du paquet « serveur-prive » pour installer et démarrer ce serveur (Docker, Nginx, Apache, ou directement avec Node.js).' + (psCfg ? '' : ' Si un serveur privé est connecté, il est utilisé en priorité sur Firebase ci-dessous.') + '</p>' +
+    '<div class="hr"></div><h3 style="margin-bottom:8px">Ou connecter Firebase (gratuit, hébergé par Google)</h3>' +
+    '<p class="muted small" style="margin-bottom:10px">Alternative sans serveur à installer soi-même. Ce logiciel n\'est pas ouvert depuis Claude : la synchronisation entre appareils n\'est pas automatique ici. Pour l\'activer gratuitement, créez un projet sur <b>console.firebase.google.com</b>, activez <b>Firestore Database</b>, ajoutez une application Web, puis collez ci-dessous le bloc de configuration fourni.</p>' +
+    (fbCfg ? '<p class="muted small" style="margin-bottom:10px">Projet connecté : <b>' + esc(fbCfg.projectId) + '</b> · état : ' + (S.sync === 'db' ? '<span class="pill ok">Connecté</span>' : '<span class="pill low">Non connecté (vérifiez la configuration et les règles Firestore)</span>') + '</p>' : '') +
+    fld('Configuration Firebase', '<textarea class="ta" id="fb-config" rows="6" placeholder="const firebaseConfig = {\n  apiKey: &quot;...&quot;,\n  authDomain: &quot;...&quot;,\n  projectId: &quot;...&quot;,\n  ...\n};"></textarea>', 'Collez tout le bloc copié depuis la console Firebase (« Ajouter une application Web »).') +
+    '<div class="vh-actions"><button type="button" class="btn btn-primary" data-act="fb-save">' + ic('swap') + 'Enregistrer et se connecter</button>' + (fbCfg ? '<button type="button" class="btn btn-danger" data-act="fb-clear">Retirer Firebase</button>' : '') + '</div>' +
+    '<p class="muted small" style="margin-top:10px">Dans Firestore → Règles, autorisez la lecture et l\'écriture (par exemple <code>allow read, write: if true;</code>) : ce logiciel n\'utilise pas de compte Google pour accéder à la base, seul le code PIN protège l\'accès au logiciel. Ne diffusez pas ce lien au-delà de votre équipe.</p>';
+}
+
+/* ---------- Écran de connexion obligatoire (avant toute donnée) ---------- */
+function viewServerGate() {
+  const title = S.boot === 'needs-config' ? 'Connexion à un serveur requise'
+    : S.boot === 'error' ? 'Connexion au serveur impossible'
+    : 'Connexion au serveur en cours…';
+  const lead = S.boot === 'needs-config'
+    ? 'Ce logiciel n\'enregistre plus aucune donnée dans ce navigateur : les données (commandes, stock, ventes, clients…) doivent être stockées sur un serveur. Configurez une connexion ci-dessous pour commencer.'
+    : S.boot === 'error'
+    ? 'Impossible de joindre le serveur configuré : « ' + esc(S.bootError || 'raison inconnue') + ' ». Vérifiez l\'adresse et le code d\'accès ci-dessous, puis réessayez.'
+    : 'Merci de patienter pendant la connexion au serveur configuré…';
+  const retryBtn = S.boot === 'error' ? '<button type="button" class="btn btn-primary" style="margin-bottom:18px" data-act="retry-connect">' + ic('swap') + 'Réessayer la connexion</button>' : '';
+  return '<div class="login-wrap"><div class="login-card wide">' +
+    '<div class="estab-row" style="padding:0 0 18px;justify-content:center">' + ic('swap') + '<h1 style="font-size:22px">Comptoir</h1></div>' +
+    '<h2 style="margin-bottom:6px">' + title + '</h2>' +
+    '<p class="muted" style="margin-bottom:16px">' + lead + '</p>' +
+    retryBtn +
+    (S.boot !== 'connecting' ? syncFormsHtml() : '') +
+    '</div></div>';
+}
+
 /* ---------- Réglages ---------- */
 function viewReglages() {
   const theme = (function () { try { return localStorage.getItem('comptoir.theme') || 'auto'; } catch (e) { return 'auto'; } })();
   const pw = String(S.cfg.paperWidth || '80');
-  const fbCfg = getFirebaseConfig();
-  const psCfg = getPrivateServerConfig();
-  const phpCfg = getPhpServerConfig();
   return vh('Réglages', 'Établissement, taxes, apparence, impression, fidélité, chambres, salles et sauvegardes') +
     '<div class="grid2"><div class="stack"><section class="card"><h2>Établissement</h2>' +
     fld('Nom', '<input class="in" id="cfg-name" data-bind="cfg-name" value="' + esc(S.cfg.name) + '" autocomplete="off">') +
@@ -1814,29 +1873,8 @@ function viewReglages() {
     '<p class="muted small">Exemple de numéro : <b>' + esc(formatInvoiceNum(S.invoices.reduce((m, i) => Math.max(m, i.num), 0) + 1)) + '</b></p>' +
     '<button type="button" class="btn btn-sm" style="margin-top:8px" data-act="nav" data-v="factures">' + ic('invoice') + 'Voir le registre des factures</button></section></div>' +
     '<div class="stack"><section class="card"><h2>Sécurité</h2><p class="muted" style="margin-bottom:12px">L\'accès au logiciel est contrôlé par des comptes nommés (caissière, cuisine, manager, administrateur), chacun avec son propre code PIN.</p><div class="vh-actions"><button type="button" class="btn btn-primary" data-act="nav" data-v="users">' + ic('badge') + 'Gérer les utilisateurs</button><button type="button" class="btn" data-act="logout">' + ic('unlock') + 'Se déconnecter</button></div><p class="muted small" style="margin-top:10px">Cette protection décourage les accès occasionnels ; elle ne chiffre pas les données, qui restent lisibles par toute personne ayant un accès technique à cet appareil ou à ce compte.</p></section>' +
-    '<section class="card"><h2>Synchronisation</h2><p>' + (S.sync === 'db' ? '<span class="pill ok">Active</span> Les données sont enregistrées et partagées entre tous les appareils connectés à ce compte : prise de commande sur un téléphone, suivi en cuisine sur une tablette.' : '<span class="pill low">Locale</span> Les données sont enregistrées uniquement dans ce navigateur. Faites des sauvegardes régulières ci-dessous.') + '</p>' +
-    (NATIVE_CLAUDE ? '' :
-      '<h3 style="margin-bottom:8px">Connecter un serveur PHP + MySQL (hébergement mutualisé)</h3>' +
-      '<p class="muted small" style="margin-bottom:10px">Pour un hébergement classique (OVH, o2switch, cPanel…) avec PHP, MySQL et Apache — le plus courant et le moins cher. Déposez le paquet « serveur-prive-php » fourni sur votre hébergement, puis indiquez son adresse ici. La synchronisation se fait par vérification régulière (toutes les ' + (PHP_POLL_MS / 1000) + ' secondes environ) plutôt qu\'instantanément.</p>' +
-      (phpCfg ? '<p class="muted small" style="margin-bottom:10px">Serveur connecté : <b>' + esc(normalizePrivateServerUrl(phpCfg.url)) + '</b> · état : ' + (S.sync === 'db' ? '<span class="pill ok">Connecté</span>' : '<span class="pill low">Non connecté (vérifiez l\'adresse, le code et que api.php est bien déployé)</span>') + '</p>' : '') +
-      '<div class="row2">' + fld('Adresse du serveur', '<input class="in" id="php-url" placeholder="https://votre-domaine.com/comptoir-serveur" value="' + esc(phpCfg ? phpCfg.url : '') + '" autocomplete="off">', 'Dossier où vous avez déposé api.php sur votre hébergement') +
-      fld('Code d\'accès (facultatif)', '<input class="in" id="php-code" placeholder="Code défini dans config.php" value="' + esc(phpCfg ? (phpCfg.code || '') : '') + '" autocomplete="off">') + '</div>' +
-      '<div class="vh-actions"><button type="button" class="btn btn-primary" data-act="php-save">' + ic('swap') + 'Enregistrer et se connecter</button>' + (phpCfg ? '<button type="button" class="btn btn-danger" data-act="php-clear">Retirer le serveur PHP</button>' : '') + '</div>' +
-      '<p class="muted small" style="margin-top:10px">Voir le fichier LISEZ-MOI.md du paquet « serveur-prive-php » pour la mise en place (base MySQL, config.php, dépôt par FTP).' + (phpCfg ? '' : ' Si ce serveur est connecté, il est utilisé en priorité sur les options ci-dessous.') + '</p>' +
-      '<div class="hr"></div><h3 style="margin-bottom:8px">Connecter mon serveur privé (architecture client/serveur)</h3>' +
-      '<p class="muted small" style="margin-bottom:10px">Reliez Comptoir au petit serveur Node.js fourni avec le logiciel (paquet « serveur-prive »), installé sur votre propre machine ou votre VPS. Toutes les données (commandes, stock, ventes…) sont alors stockées sur ce serveur et partagées en temps réel entre tous les postes connectés — caisse, cuisine, bureau.</p>' +
-      (psCfg ? '<p class="muted small" style="margin-bottom:10px">Serveur connecté : <b>' + esc(normalizePrivateServerUrl(psCfg.url)) + '</b> · état : ' + (S.sync === 'db' ? '<span class="pill ok">Connecté</span>' : '<span class="pill low">Non connecté (vérifiez l\'adresse, le code et que le serveur est démarré)</span>') + '</p>' : '') +
-      '<div class="row2">' + fld('Adresse du serveur', '<input class="in" id="ps-url" placeholder="http://192.168.1.50:4000" value="' + esc(psCfg ? psCfg.url : '') + '" autocomplete="off">', 'Adresse locale ou domaine de votre serveur privé') +
-      fld('Code d\'accès (facultatif)', '<input class="in" id="ps-code" placeholder="Code défini sur le serveur (ACCESS_CODE)" value="' + esc(psCfg ? (psCfg.code || '') : '') + '" autocomplete="off">') + '</div>' +
-      '<div class="vh-actions"><button type="button" class="btn btn-primary" data-act="ps-save">' + ic('swap') + 'Enregistrer et se connecter</button>' + (psCfg ? '<button type="button" class="btn btn-danger" data-act="ps-clear">Retirer le serveur privé</button>' : '') + '</div>' +
-      '<p class="muted small" style="margin-top:10px">Voir le fichier LISEZ-MOI.md du paquet « serveur-prive » pour installer et démarrer ce serveur (Docker, Nginx, Apache, ou directement avec Node.js).' + (psCfg ? '' : ' Si un serveur privé est connecté, il est utilisé en priorité sur Firebase ci-dessous.') + '</p>' +
-      '<div class="hr"></div><h3 style="margin-bottom:8px">Ou connecter Firebase (gratuit, hébergé par Google)</h3>' +
-      '<p class="muted small" style="margin-bottom:10px">Alternative sans serveur à installer soi-même. Ce logiciel n\'est pas ouvert depuis Claude : la synchronisation entre appareils n\'est pas automatique ici. Pour l\'activer gratuitement, créez un projet sur <b>console.firebase.google.com</b>, activez <b>Firestore Database</b>, ajoutez une application Web, puis collez ci-dessous le bloc de configuration fourni.</p>' +
-      (fbCfg ? '<p class="muted small" style="margin-bottom:10px">Projet connecté : <b>' + esc(fbCfg.projectId) + '</b> · état : ' + (S.sync === 'db' ? '<span class="pill ok">Connecté</span>' : '<span class="pill low">Non connecté (vérifiez la configuration et les règles Firestore)</span>') + '</p>' : '') +
-      fld('Configuration Firebase', '<textarea class="ta" id="fb-config" rows="6" placeholder="const firebaseConfig = {\n  apiKey: &quot;...&quot;,\n  authDomain: &quot;...&quot;,\n  projectId: &quot;...&quot;,\n  ...\n};"></textarea>', 'Collez tout le bloc copié depuis la console Firebase (« Ajouter une application Web »).') +
-      '<div class="vh-actions"><button type="button" class="btn btn-primary" data-act="fb-save">' + ic('swap') + 'Enregistrer et se connecter</button>' + (fbCfg ? '<button type="button" class="btn btn-danger" data-act="fb-clear">Retirer Firebase</button>' : '') + '</div>' +
-      '<p class="muted small" style="margin-top:10px">Dans Firestore → Règles, autorisez la lecture et l\'écriture (par exemple <code>allow read, write: if true;</code>) : ce logiciel n\'utilise pas de compte Google pour accéder à la base, seul le code PIN protège l\'accès au logiciel. Ne diffusez pas ce lien au-delà de votre équipe.</p>'
-    ) + '</section>' +
+    '<section class="card"><h2>Synchronisation</h2><p>' + (S.sync === 'db' ? '<span class="pill ok">Active</span> Les données sont enregistrées sur le serveur connecté et partagées entre tous les appareils : prise de commande sur un téléphone, suivi en cuisine sur une tablette.' : NATIVE_CLAUDE ? '<span class="pill low">Non connecté</span> Connexion au stockage en cours ou indisponible.' : '<span class="pill low">Non connecté</span> Ce logiciel n\'enregistre plus aucune donnée dans ce navigateur. Configurez un serveur ci-dessous pour pouvoir l\'utiliser.') + '</p>' +
+    syncFormsHtml() + '</section>' +
     '<section class="card"><h2>Sauvegarde</h2><p class="muted" style="margin-bottom:12px">Exportez toutes vos données (carte, stock, commandes) dans un fichier, ou restaurez une sauvegarde.</p><div class="vh-actions">' +
     (S.dl ? '<button type="button" class="btn" data-act="backup">' + ic('down') + 'Exporter une sauvegarde</button>' : '') +
     '<label class="btn" style="cursor:pointer">Restaurer une sauvegarde<input type="file" accept="application/json,.json" data-bind="restore" hidden></label></div></section>' +
@@ -1851,6 +1889,12 @@ const VIEWS = {login: viewLogin, dashboard: viewDashboard, pos: viewPos, suivi: 
    ===================================================================== */
 function render() {
   const main = $('#main');
+  if (S.boot !== 'ready') {
+    main.innerHTML = viewServerGate();
+    $('#side').innerHTML = '<div class="brand"><span class="mark" aria-hidden="true">C</span><span class="bname">Comptoir</span></div>';
+    $('#tabbar').innerHTML = '';
+    return;
+  }
   const ae = document.activeElement;
   const keep = (ae && ae.id && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) && main.contains(ae)) ? {id: ae.id, s: ae.selectionStart, e: ae.selectionEnd} : null;
   const sy = window.scrollY, inner = {};
@@ -2461,11 +2505,12 @@ document.addEventListener('click', e => {
     case 'paperw': S.cfg.paperWidth = v; persistCatalog(); render(); break;
     case 'backup': saveFile('comptoir-sauvegarde-' + fileStamp() + '.json', JSON.stringify({app: 'comptoir', v: 1, date: new Date().toISOString(), cfg: S.cfg, products: S.products, stock: S.stock, orders: S.orders, invoices: S.invoices, customers: S.customers, rooms: S.rooms, roomPayments: S.roomPayments, halls: S.halls, hallPayments: S.hallPayments, employees: S.employees, expenses: S.expenses, users: S.users, shifts: S.shifts, log: S.log, accessLog: S.accessLog}, null, 1)); break;
     case 'fb-save': { const ta = $('#fb-config'); if (!ta) break; const cfg = parseFirebaseConfigPaste(ta.value); if (!cfg) { toast('Configuration Firebase invalide. Collez le bloc complet depuis la console Firebase.'); break; } try { localStorage.setItem(FB_KEY, JSON.stringify(cfg)); } catch (e) {} toast('Configuration enregistrée. Reconnexion…'); setTimeout(() => location.reload(), 900); break; }
-    case 'fb-clear': confirmBox('Retirer la configuration Firebase ?', 'Le logiciel repassera en mode local sur cet appareil.', 'Retirer', () => { try { localStorage.removeItem(FB_KEY); } catch (e) {} location.reload(); }); break;
+    case 'fb-clear': confirmBox('Retirer la configuration Firebase ?', 'Sans serveur configuré, le logiciel ne pourra plus être utilisé tant qu\'une connexion n\'est pas rétablie.', 'Retirer', () => { try { localStorage.removeItem(FB_KEY); } catch (e) {} location.reload(); }); break;
     case 'php-save': { const urlEl = $('#php-url'), codeEl = $('#php-code'); if (!urlEl) break; const url = normalizePrivateServerUrl(urlEl.value); if (!url) { toast('Indiquez l\'adresse de votre serveur PHP.'); break; } try { localStorage.setItem(PHP_KEY, JSON.stringify({url, code: codeEl ? codeEl.value.trim() : ''})); } catch (e) {} toast('Configuration enregistrée. Connexion…'); setTimeout(() => location.reload(), 900); break; }
-    case 'php-clear': confirmBox('Retirer la connexion au serveur PHP + MySQL ?', 'Le logiciel repassera en mode local sur cet appareil (ou sur une autre option de synchronisation si configurée).', 'Retirer', () => { try { localStorage.removeItem(PHP_KEY); } catch (e) {} location.reload(); }); break;
+    case 'php-clear': confirmBox('Retirer la connexion au serveur PHP + MySQL ?', 'Sans serveur configuré, le logiciel ne pourra plus être utilisé tant qu\'une connexion n\'est pas rétablie (sauf autre option déjà configurée).', 'Retirer', () => { try { localStorage.removeItem(PHP_KEY); } catch (e) {} location.reload(); }); break;
     case 'ps-save': { const urlEl = $('#ps-url'), codeEl = $('#ps-code'); if (!urlEl) break; const url = normalizePrivateServerUrl(urlEl.value); if (!url) { toast('Indiquez l\'adresse de votre serveur privé.'); break; } try { localStorage.setItem(PS_KEY, JSON.stringify({url, code: codeEl ? codeEl.value.trim() : ''})); } catch (e) {} toast('Configuration enregistrée. Connexion…'); setTimeout(() => location.reload(), 900); break; }
-    case 'ps-clear': confirmBox('Retirer la connexion au serveur privé ?', 'Le logiciel repassera en mode local sur cet appareil (ou sur Firebase si configuré).', 'Retirer', () => { try { localStorage.removeItem(PS_KEY); } catch (e) {} location.reload(); }); break;
+    case 'ps-clear': confirmBox('Retirer la connexion au serveur privé ?', 'Sans serveur configuré, le logiciel ne pourra plus être utilisé tant qu\'une connexion n\'est pas rétablie (sauf Firebase déjà configuré).', 'Retirer', () => { try { localStorage.removeItem(PS_KEY); } catch (e) {} location.reload(); }); break;
+    case 'retry-connect': location.reload(); break;
     case 'reset-demo': confirmBox('Recharger les données d\'exemple ?', 'La carte, le stock, les chambres, les salles et toutes les commandes, factures et clients actuels seront remplacés. Les comptes utilisateurs sont conservés.', 'Remplacer', () => { replaceAll(seedData()); toast('Données d\'exemple chargées.'); }); break;
     case 'reset-empty': confirmBox('Tout effacer ?', 'La carte, le stock, les chambres, les salles, les clients, les employés, les dépenses, les commandes et l\'historique seront supprimés définitivement. Les comptes utilisateurs sont conservés. Pensez à exporter une sauvegarde avant.', 'Tout effacer', () => { const b = seedData(); b.products = []; b.stock = []; b.rooms = []; b.halls = []; b.employees = []; b.expenses = []; replaceAll(b); toast('Toutes les données ont été effacées.'); }); break;
   }
@@ -2571,18 +2616,26 @@ document.addEventListener('change', onField);
    ===================================================================== */
 applyTheme();
 render();
-(async function bootSync() {
+async function bootSync() {
+  if (NATIVE_CLAUDE) { attachDb(); return; }
   const phpCfg = getPhpServerConfig();
   if (phpCfg && phpCfg.url) {
-    try { await bootPhpServerSync(); attachDb(); return; } catch (e) { console.error('Serveur PHP', e); S.sync = 'local'; renderSide(); }
+    try { await bootPhpServerSync(); attachDb(); return; }
+    catch (e) { console.error('Serveur PHP', e); S.sync = 'local'; S.boot = 'error'; S.bootError = (e && e.message) || 'Connexion impossible'; render(); return; }
   }
   const psCfg = getPrivateServerConfig();
   if (psCfg && psCfg.url) {
-    try { await bootPrivateServerSync(); attachDb(); return; } catch (e) { console.error('Serveur privé', e); S.sync = 'local'; renderSide(); }
+    try { await bootPrivateServerSync(); attachDb(); return; }
+    catch (e) { console.error('Serveur privé', e); S.sync = 'local'; S.boot = 'error'; S.bootError = (e && e.message) || 'Connexion impossible'; render(); return; }
   }
-  try { await bootExternalSync(); } catch (e) { console.error('Firebase', e); }
-  attachDb();
-})();
+  const fbCfg = getFirebaseConfig();
+  if (fbCfg) {
+    try { await bootExternalSync(); attachDb(); return; }
+    catch (e) { console.error('Firebase', e); S.sync = 'local'; S.boot = 'error'; S.bootError = (e && e.message) || 'Connexion impossible'; render(); return; }
+  }
+  /* Aucun serveur configuré : l'écran de connexion obligatoire est déjà affiché (S.boot === 'needs-config'). */
+}
+bootSync();
 setInterval(() => { if (S.ui.view === 'suivi' || S.ui.view === 'dashboard') render(); }, 60000);
 })();
 </script>
